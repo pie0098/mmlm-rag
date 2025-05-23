@@ -1,154 +1,137 @@
-import torch
-from peft import PeftModel
-from transformers import (
-    ColPaliForRetrieval,
-    ColPaliProcessor,
-    AutoProcessor,
-    Qwen2_5_VLForConditionalGeneration,
-)
+import os
+import shutil
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime
 import gradio as gr
-from PIL import Image
-from torch.utils.data import DataLoader
-from tqdm import tqdm
-from qwen_vl_utils import process_vision_info
+import json
+from typing import List
+import multiprocessing
 from pdf2image import convert_from_path
 
+MAX_WORKERS = min(32, multiprocessing.cpu_count())
 # =======================================
-# 1. 全局加载：只运行一次，并放在 CUDA
+# 6. Gradio Interface Configuration
 # =======================================
-DEVICE = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
-# (1) ColPali 检索模型 + Adapter
-BASE_MODEL_PATH = "/home/linux/yyj/colpali/finetune/colpali-v1.2-hf"
-ADAPTER_PATH    = "/home/linux/yyj/colpali/finetune/wiki_city"
+def save_uploaded_file(
+        files, save_file_dir, save_image_dir, state_f, dpi=300, fmt="png", 
+        max_workers=MAX_WORKERS
+):
+    
+    os.makedirs(save_image_dir, exist_ok=True)
+    os.makedirs(save_file_dir, exist_ok=True)
+    
+    dst_paths = []
+    for file in files:
+        src = file.name
+        dst = os.path.join(save_file_dir, os.path.basename(src))
+        dst_paths.append(dst)
+        shutil.copy2(src, dst)
+        state_f.append(f"✔ Saved PDF: {dst}")
 
-colpali_base = ColPaliForRetrieval.from_pretrained(
-    BASE_MODEL_PATH,
-    torch_dtype=torch.bfloat16,
-    device_map={"": DEVICE}
-)
-colpali_model = PeftModel.from_pretrained(colpali_base, ADAPTER_PATH)
-colpali_model.to(DEVICE)
-colpali_processor = ColPaliProcessor.from_pretrained(ADAPTER_PATH)
+        yield "\n".join(state_f), state_f
 
-# (2) Qwen2.5-VL 文图生成模型
-QWEN_DIR   = "/home/linux/yyj/colpali/finetune/Qwen2.5-VL-3B-Instruct"
-qwen_model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-    QWEN_DIR,
-    torch_dtype=torch.bfloat16,
-    device_map={"": DEVICE}
-)
-qwen_model.to(DEVICE)
-qwen_processor = AutoProcessor.from_pretrained(QWEN_DIR, max_pixels=1280*28*28)
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {
+            executor.submit(convert_from_path, path, dpi=dpi, fmt=fmt.lower(), thread_count=3) : path
+            for path in dst_paths
+        }
+        
+        for future in as_completed(futures):
+            pdf_path = futures[future]
+            name = os.path.splitext(os.path.basename(pdf_path))[0]
+            image_out_dir = os.path.join(save_image_dir, name)
+            os.makedirs(image_out_dir, exist_ok=True)
 
-# =======================================
-# 2. 索引函数：批量化 & 全部放 CUDA
-# =======================================
-def index(file_list, ds):
-    images = []
-    for f in file_list:
-        images.extend(convert_from_path(f))
-    loader = DataLoader(
-        images, batch_size=8, shuffle=False,
-        collate_fn=lambda imgs: colpali_processor.process_images(imgs)
-    )
-    for batch in tqdm(loader, desc="索引页面"):
-        with torch.no_grad():
-            batch = {k: v.to(DEVICE) for k, v in batch.items()}
-            out = colpali_model(**batch)
-            embs = out.embeddings  # b x seq_len x dim on DEVICE
-            ds.extend(torch.unbind(embs))
-    return f"已上传并索引 {len(images)} 页", ds, images
+            try:
+                images = future.result()
+                state_f.append(f"✔ Start to save images from {pdf_path}")
+                yield "\n".join(state_f), state_f
+                print(f"✔ Start to save images from {pdf_path}")
 
-# =======================================
-# 3. 检索函数：单 query 批量 & CUDA
-# =======================================
-def search(query: str, ds, images):
-    with torch.no_grad():
-        q_inputs = colpali_processor.process_queries([query])
-        q_inputs = {k: v.to(DEVICE) for k, v in q_inputs.items()}
-        out = colpali_model(**q_inputs)
-        q_embs = out.embeddings  # 1 x seq_len x dim on DEVICE
-        qs = list(torch.unbind(q_embs))
-    scores = colpali_processor.score_retrieval(qs, ds)
-    best_idx = int(scores.argmax())
-    return f"最相关的页面是 {best_idx}", images[best_idx]
+            except Exception as e:
+                state_f.append(f"✖ Error converting {pdf_path}: {e}")
+                yield "\n".join(state_f), state_f
+                print(f"✖ Error converting {pdf_path}: {e}")
 
-# =======================================
-# 4. 多模态问答：全部 CUDA
-# =======================================
-FIXED_PROMPT = (
-    "请详细分析这张图片的内容，包括但不限于：\n"
-    "1. 图片的主要内容和主题\n"
-    "2. 图片中的关键信息点\n"
-    "3. 图片的布局和结构\n"
-    "4. 图片中可能包含的重要数据或统计信息\n"
-    "请以结构化的方式输出，确保信息清晰易读。"
-)
+                continue
+            n_pages = len(images)
+            for idx, img in enumerate(images, start=1):
+                # frac = idx / n_pages
+                # progress(frac, desc=f"Saving page {idx}/{n_pages}")
+                img_out_file = os.path.join(image_out_dir, f"page_{idx:03d}.{fmt.lower()}")
+                img.save(img_out_file, fmt)
+                state_f.append(f"✔ Converted {n_pages} pages for {name}, Saved page {idx:03d}: {image_out_dir}")
+                yield "\n".join(state_f), state_f
+                print(f"✔ Converted {n_pages} pages for {name}, Saved page {idx:03d}: {image_out_dir}")
+            
+            state_f.append(f"✔ Converted {n_pages} pages for {name}, Saved page {idx:03d}: {image_out_dir}")
+            yield "\n".join(state_f), state_f
+            print(f"✔ Sucessfully convert {name} to images at {image_out_dir} with {n_pages} pages !")
+    
+    state_f.append("🎉 All done !")
+    yield "\n".join(state_f), state_f
+    print("🎉 All done !")
 
-def get_answer_qwen25vl(prompt: str, image: Image.Image):
-    messages = [
-        {"role": "user", "content": [
-            {"type": "image", "image": image},
-            {"type": "text",  "text": prompt},
-        ]}
-    ]
-    text = qwen_processor.apply_chat_template(
-        messages, tokenize=False, add_generation_prompt=True
-    )
-    img_inputs, vid_inputs = process_vision_info(messages)
-    inputs = qwen_processor(
-        text=[text],
-        images=img_inputs,
-        videos=vid_inputs,
-        padding=True,
-        return_tensors="pt",
-    )
-    inputs = {k: v.to(DEVICE) for k, v in inputs.items()}
 
-    with torch.no_grad():
-        output_ids = qwen_model.generate(**inputs, max_new_tokens=512)
-    trimmed = [out[len(inp):] for inp, out in zip(inputs['input_ids'], output_ids)]
-    return qwen_processor.batch_decode(
-        trimmed,
-        skip_special_tokens=True,
-        clean_up_tokenization_spaces=False
-    )[0]
 
-# =======================================
-# 5. 组合函数
-# =======================================
-def search_with_llm(query, ds, images):
-    msg, best_img = search(query, ds, images)
-    answer = get_answer_qwen25vl(query, best_img)
-    return msg, best_img, answer
+with gr.Blocks(analytics_enabled=False) as demo:
+    gr.Markdown("# ColPali Document + Multimodal QA System 📚🔍")
+    
+    with gr.Tabs():
+ 
+        with gr.TabItem("Upload"):
+            gr.Markdown("## File Upload Interface")
+            
+            with gr.Column():
+                with gr.Row(equal_height=True):
+                    save_file_dir = gr.Textbox(
+                        label="Saved File Directory",
+                        placeholder="Enter directory path to save files",
+                        value="/home/linux/yyj/colpali/mmlm-rag/file_uploads"
+                    )                    
+                    save_image_dir = gr.Textbox(
+                        label="Saved Image Directory",
+                        placeholder="Enter directory path to save files",
+                        value="/home/linux/yyj/colpali/mmlm-rag/test_pages"
+                    )
+                with gr.Row():
+                    btn_file = gr.Button("Convert File into image")
+                    btn_dir = gr.Button("Upload Image Embeddings to Milvus")
+            
+            files = gr.Files(
+                file_types=[".pdf"],
+                label="Upload PDF File",
+                type="filepath"
+            )
+            with gr.Row():
+                file_status = gr.Textbox(label="File Status", lines=10, max_lines=10, show_copy_button=True)
+                image_status = gr.Textbox(label="Image Status", lines=10, max_lines=10, show_copy_button=True)
+            
+            state_f = gr.State([])
+            state_imgs = gr.State([])
+        
+            btn_file.click(
+                save_uploaded_file,
+                inputs=[files, save_file_dir, save_image_dir, state_f],
+                outputs=[file_status, state_f]
+            )
 
-# =======================================
-# 6. Gradio 界面配置
-# =======================================
-with gr.Blocks() as demo:
-    gr.Markdown("# ColPali 文档 + 多模态问答系统 📚🔍")
-    file    = gr.File(file_types=[".pdf"], file_count="multiple", label="上传 PDF")
-    btn_idx = gr.Button("转换并索引")
-    out_msg = gr.Textbox(label="状态")
-    state_ds  = gr.State([])
-    state_imgs= gr.State([])
 
-    btn_idx.click(
-        index, inputs=[file, state_ds], outputs=[out_msg, state_ds, state_imgs]
-    )
-
-    qry    = gr.Textbox(placeholder="输入查询", label="查询文本")
-    btn_s  = gr.Button("搜索")
-    out_msg2 = gr.Textbox(label="检索结果")
-    out_img  = gr.Image(label="最佳页面")
-    out_txt  = gr.Textbox(label="模型回答")
-
-    btn_s.click(
-        search_with_llm,
-        inputs=[qry, state_ds, state_imgs],
-        outputs=[out_msg2, out_img, out_txt]
-    )
+        with gr.TabItem("Train"):
+            gr.Markdown("## Training Interface")
+            train_input = gr.Textbox(label="Training Data")
+            train_btn = gr.Button("Start Training")
+            train_output = gr.Textbox(label="Training Status")
+            
+        with gr.TabItem("Chat"):
+            gr.Markdown("## Chat Interface")
+            qry = gr.Textbox(placeholder="Enter your query", label="Query Text")
+            btn_s = gr.Button("Search")
+            out_msg2 = gr.Textbox(label="Search Results")
+            out_img = gr.Image(label="Best Matching Page")
+            out_txt = gr.Textbox(label="Model Response")
+            
 
 if __name__ == "__main__":
-    demo.queue(max_size=10).launch(debug=True, share=True)
+    demo.queue().launch()
