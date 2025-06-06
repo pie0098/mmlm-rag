@@ -3,6 +3,74 @@ import os
 from PIL import Image
 import argparse
 
+import cv2
+import os
+import json
+from typing import Optional
+
+def split_2x2_image_and_save_json(image_dir, output_dir, saved_json: Optional[bool] = False):
+    
+    os.makedirs(output_dir, exist_ok=True)
+    results = []
+
+    for dir in os.listdir(image_dir):
+
+        old_dir = os.path.join(image_dir, dir)
+        new_dir = os.path.join(output_dir, dir)
+
+        os.makedirs(new_dir, exist_ok=True)
+        if len(os.listdir(new_dir)):
+                continue
+
+        for file in os.listdir(old_dir):
+
+            old_file_path = os.path.join(old_dir, file)
+            # 读取图片
+            img = cv2.imread(old_file_path)
+            if img is None:
+                raise ValueError(f"无法读取图片: {old_file_path}")
+            
+            # 获取图片尺寸
+            height, width = img.shape[:2]
+            half_w, half_h = width // 2, height // 2
+            # 定义四个子区域
+            quadrants = [
+                img[0:half_h,       0:half_w],   # 左上
+                img[0:half_h,       half_w:width], # 右上
+                img[half_h:height,  0:half_w],   # 左下
+                img[half_h:height,  half_w:width]  # 右下
+            ]
+            
+            # 保存结果信息
+            
+            # 保存每个象限
+            for i, q in enumerate(quadrants, start=1):
+                # 生成保存路径
+                base_name = os.path.splitext(os.path.basename(file))[0]
+                save_path = os.path.join(new_dir, f"{base_name}_q{i}.png")
+                # 保存图片
+                cv2.imwrite(save_path, q)
+                # 记录信息
+                results.append({
+                    "image_path": save_path,
+                    "caption" : "",
+                    "generated" : ""
+                })
+    if saved_json:
+        try:
+            file_name = "split_2x2_image_cap_pairs.json"
+            json_path = os.path.join(output_dir, file_name)
+
+            with open(json_path, 'w', encoding='utf-8') as f:
+                json.dump(results, f, ensure_ascii=False, indent=2)
+
+            print(f"save results in file {json_path}")
+        except Exception as e:
+            print(f"save results in file with error: {e}")
+# image_dir = "/home/linux/yyj/colpali/finetune/pdf2images"
+# output_dir = "/home/linux/yyj/colpali/finetune/pdfTo_2x2_image"
+# split_2x2_image_and_save_json(image_dir, output_dir, saved_json=True)
+
 def pdf_to_images(pdf_path: str, output_dir: str, dpi: int = 300, fmt: str = 'PNG'):
     """
     Convert a PDF file to images    
