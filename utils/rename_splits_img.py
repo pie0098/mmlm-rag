@@ -1,10 +1,10 @@
 import os
 import re
 
-# 顶层目录
+# Top-level directory
 ROOT_DIR = "/home/linux/yyj/colpali/finetune/pdf2images_all_splits"
 
-# 用来提取 “页号-分块号” 的正则：捕获两个数字组
+# Regex to extract "page number-chunk number": captures two groups of digits
 PAT = re.compile(r"(\d+)[-_](\d+)")
 
 for sub in os.listdir(ROOT_DIR):
@@ -17,8 +17,8 @@ for sub in os.listdir(ROOT_DIR):
             continue
         m = PAT.search(fn)
         if not m:
-            # 如果文件名格式不符合预期，可以选择跳过或打印警告
-            print(f"⚠️ 跳过无法解析的文件: {os.path.join(sub, fn)}")
+            # If the filename format does not match the expectation, you can choose to skip or print a warning
+            print(f"⚠️ Skipping unparseable file: {os.path.join(sub, fn)}")
             continue
 
         page_str, chunk_str = m.groups()
@@ -29,12 +29,12 @@ for sub in os.listdir(ROOT_DIR):
         src = os.path.join(subdir, fn)
         dst = os.path.join(subdir, new_name)
 
-        # 如果目标名已存在，可先删除或跳过
+        # If the target name already exists, you can delete or skip it first
         if os.path.exists(dst):
-            print(f"⚠️ 目标已存在，跳过: {dst}")
+            print(f"⚠️ Target already exists, skipping: {dst}")
             continue
 
         os.rename(src, dst)
         print(f"{src}  →  {dst}")
 
-print("✅ 重命名完成！")
+print("✅ Renaming completed!")

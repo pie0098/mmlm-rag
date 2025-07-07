@@ -66,9 +66,9 @@ class MilvusColbertRetriever:
 
     def search(self, data, topk):
         # data=query
-        # "params": {} 空字典，意思是没有额外的参数传递给索引算法HNSW
+        # "params": {} means no extra parameters are passed to the HNSW index algorithm
         search_params = {"metric_type": "IP", "params": {}}
-        # len(results)=22(query.length), each query vector(1*128) has top50 similar doc vector (1*128)
+        # len(results)=22(query.length), each query vector (1*128) has top50 similar doc vector (1*128)
         results = self.client.search(
             self.collection_name,
             data,
@@ -77,7 +77,7 @@ class MilvusColbertRetriever:
             search_params=search_params,
         )
         docs = set()
-        # 对一个query的每个行向量（共22个），其top50的doc_id结果去重
+        # For each row vector of a query (22 in total), deduplicate the doc_id results of its top50
         for r_id in range(len(results)):
             for r in range(len(results[r_id])):
                 docs.add(results[r_id][r]["entity"]["doc"])
@@ -90,13 +90,13 @@ class MilvusColbertRetriever:
                 collection_name=collection_name,
                 filter=f"doc=='{doc}'",
                 output_fields=["seq_id", "vector", "doc"],
-                limit=400, # 返回前400行向量
+                limit=400, # return the first 400 row vectors
             )
-            # stack这些向量
+            # stack these vectors
             doc_vecs = np.vstack(
                 [doc_colbert_vecs[i]["vector"] for i in range(len(doc_colbert_vecs))]
             )
-            # 做single query-doc_id 的colbert 的late interaction计算
+            # Perform ColBERT late interaction calculation for a single query-doc_id
             score = np.dot(data, doc_vecs.T).max(1).sum()
             return (score, doc)
 
@@ -110,21 +110,21 @@ class MilvusColbertRetriever:
             for future in concurrent.futures.as_completed(futures):
                 score, doc = future.result()
                 scores.append((score, doc))
-        # 以scores中每个元组的score来排序
+        # sort by the score in each tuple in scores
         scores.sort(key=lambda x: x[0], reverse=True)
-        # 总数超过topk，取出topk个；否则全部返回
+        # if the total exceeds topk, take the topk; otherwise, return all
         if len(scores) >= topk:
             return scores[:topk]
         else:
             return scores
 
     def insert(self, data):
-        # 传入为一张图片/pdf页面的embedding，1064*128
-        # data["colbert_vecs"]是list，1064*128，list中每一行都是1*128torch.tensor
+        # The input is the embedding of an image/pdf page, 1064*128
+        # data["colbert_vecs"] is a list, 1064*128, each row in the list is a 1*128 torch.tensor
         colbert_vecs = [vec for vec in data["colbert_vecs"]]
         # seq_length = 1064
         seq_length = len(colbert_vecs)
-        # 为1064行vector生成相同的doc_id, docs的文件地址
+        # Generate the same doc_id for 1064 row vectors, docs is the file path
         # repeat data["doc_id"] for seq_length times, [doc_id, ..., doc_id];
         doc_ids = [data["doc_id"] for i in range(seq_length)]
         # seq_ids = [0,1,2,...,1059]
